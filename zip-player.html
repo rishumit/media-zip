@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="ניסוי: איתור וניגון קובץ MP4 מתוך ZIP באמצעות בקשות טווח.">
+  <meta name="robots" content="noindex">
+  <meta name="color-scheme" content="light dark">
+  <title>ניסוי ניגון MP4 מתוך ZIP</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.6 system-ui, sans-serif; background: #101914; color: #edf5ef; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 2rem 1rem; }
+    main { width: min(52rem, 100%); margin: auto; }
+    h1 { line-height: 1.2; }
+    .card { padding: 1.25rem; margin-block: 1rem; border: 1px solid #385347; border-radius: 12px; background: #17251e; }
+    label { display: block; margin-block: .8rem .25rem; font-weight: 650; }
+    input, select, button { width: 100%; padding: .7rem; border: 1px solid #668474; border-radius: 7px; font: inherit; }
+    input, select { background: #0e1913; color: inherit; }
+    button { margin-top: 1rem; background: #256d4d; color: white; font-weight: 700; cursor: pointer; }
+    button:disabled { cursor: wait; opacity: .65; }
+    video { display: block; width: 100%; max-height: 70vh; margin-top: 1rem; background: black; }
+    #status { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .note { color: #c2d3c8; }
+    code { direction: ltr; unicode-bidi: isolate; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ניסוי: ניגון MP4 מתוך ZIP</h1>
+    <section class="card">
+      <p>הדף מבקש טווחי בתים מכתובת ה‑ZIP, מאתר את קובצי הווידאו בארכיון, ומאפשר לבחור MP4 שלא נדחס (ZIP method: Store).</p>
+      <p class="note"><strong>חשוב:</strong> הדפדפן יקבל את כל נתוני הווידאו וישמור אותם בזיכרון לפני הניגון. בקשות הרשת הן ל‑ZIP, אבל זה לא סטרימינג בצד שרת. קובצי ZIP בדחיסה רגילה (Deflate) לא נתמכים בניסוי הזה. השרת חייב לאפשר CORS ובקשות Range.</p>
+      <label for="zip-url">כתובת קובץ ZIP</label>
+      <input id="zip-url" type="url" dir="ltr" spellcheck="false"
+        value="https://mitmachim.top/assets/uploads/files/1702457984802-%D7%94%D7%A7%D7%9C%D7%98%D7%AA-%D7%9E%D7%A1%D7%9A.zip">
+      <button id="inspect" type="button">בדיקת ZIP ואיתור סרטונים</button>
+      <label for="entries">קובץ וידאו בארכיון</label>
+      <select id="entries" disabled>
+        <option>יש לבדוק את ה‑ZIP תחילה</option>
+      </select>
+      <button id="play" type="button" disabled>טעינת הסרטון וניגון</button>
+      <p id="status" role="status" aria-live="polite">מוכן לבדיקה.</p>
+      <video id="video" controls playsinline hidden></video>
+    </section>
+    <p><a href="./">חזרה לאתר</a></p>
+  </main>
+  <script>
+    (() => {
+      const urlInput = document.querySelector("#zip-url");
+      const inspectButton = document.querySelector("#inspect");
+      const entriesSelect = document.querySelector("#entries");
+      const playButton = document.querySelector("#play");
+      const status = document.querySelector("#status");
+      const video = document.querySelector("#video");
+      let archiveUrl = "";
+      let archiveSize = 0;
+      let videos = [];
+      let objectUrl = "";
+
+      function setStatus(message) {
+        status.textContent = message;
+      }
+
+      async function fetchRange(url, start, end) {
+        const response = await fetch(url, {
+          headers: { Range: `bytes=${start}-${end}` },
+          cache: "no-store"
+        });
+        if (response.status !== 206) {
+          if (response.body) await response.body.cancel();
+          throw new Error(`השרת לא החזיר טווח חלקי (HTTP ${response.status}).`);
+        }
+        const contentRange = response.headers.get("Content-Range");
+        if (contentRange && !contentRange.startsWith(`bytes ${start}-${end}/`)) {
+          if (response.body) await response.body.cancel();
+          throw new Error(`השרת החזיר טווח לא צפוי: ${contentRange}`);
+        }
+        const data = await response.arrayBuffer();
+        if (data.byteLength !== end - start + 1) {
+          throw new Error("אורך המידע שהתקבל אינו תואם לטווח המבוקש.");
+        }
+        return data;
+      }
+
+      async function getFileSize(url) {
+        const response = await fetch(url, {
+          headers: { Range: "bytes=0-0" },
+          cache: "no-store"
+        });
+        if (response.status !== 206) {
+          if (response.body) await response.body.cancel();
+          throw new Error(`השרת לא החזיר טווח חלקי (HTTP ${response.status}).`);
+        }
+        const match = /^bytes 0-0\/(\d+)$/.exec(response.headers.get("Content-Range") || "");
+        if (response.body) await response.body.cancel();
+        if (!match) throw new Error("השרת לא חשף כותרת Content-Range תקינה דרך CORS.");
+        const size = Number(match[1]);
+        if (!Number.isSafeInteger(size) || size <= 0) throw new Error("גודל ה‑ZIP אינו תקין.");
+        return size;
+      }
+
+      function findEndRecord(bytes) {
+        const view = new DataView(bytes);
+        for (let i = bytes.byteLength - 22; i >= Math.max(0, bytes.byteLength - 65557); i--) {
+          if (view.getUint32(i, true) === 0x06054b50) {
+            const commentLength = view.getUint16(i + 20, true);
+            if (i + 22 + commentLength <= bytes.byteLength) return { view, offset: i };
+          }
+        }
+        throw new Error("לא נמצא סיום תקין של ארכיון ZIP.");
+      }
+
+      function readVideoEntries(bytes, entryCount) {
+        const directory = new DataView(bytes);
+        const decoder = new TextDecoder("utf-8");
+        const found = [];
+        let cursor = 0;
+        for (let i = 0; i < entryCount; i++) {
+          if (cursor + 46 > bytes.byteLength || directory.getUint32(cursor, true) !== 0x02014b50) {
+            throw new Error("תוכן ספריית הקבצים ב‑ZIP אינו תקין.");
+          }
+          const flags = directory.getUint16(cursor + 8, true);
+          const method = directory.getUint16(cursor + 10, true);
+          const compressedSize = directory.getUint32(cursor + 20, true);
+          const uncompressedSize = directory.getUint32(cursor + 24, true);
+          const nameLength = directory.getUint16(cursor + 28, true);
+          const extraLength = directory.getUint16(cursor + 30, true);
+          const commentLength = directory.getUint16(cursor + 32, true);
+          const localOffset = directory.getUint32(cursor + 42, true);
+          const nameStart = cursor + 46;
+          if (nameStart + nameLength + extraLength + commentLength > bytes.byteLength) {
+            throw new Error("רשומת קובץ פגומה בספריית ה‑ZIP.");
+          }
+          const name = decoder.decode(bytes.subarray(nameStart, nameStart + nameLength));
+          if (/\.(mp4|m4v|mov|webm)$/i.test(name)) {
+            found.push({ name, flags, method, compressedSize, uncompressedSize, localOffset });
+          }
+          cursor = nameStart + nameLength + extraLength + commentLength;
+        }
+        return found;
+      }
+
+      inspectButton.addEventListener("click", async () => {
+        inspectButton.disabled = true;
+        playButton.disabled = true;
+        entriesSelect.disabled = true;
+        videos = [];
+        setStatus("בודק גישה, CORS וגודל קובץ…");
+        try {
+          const url = new URL(urlInput.value);
+          if (url.protocol !== "https:" && url.protocol !== "http:") {
+            throw new Error("יש להזין כתובת HTTP או HTTPS.");
+          }
+          archiveUrl = url.href;
+          archiveSize = await getFileSize(archiveUrl);
+          setStatus(`הקובץ בגודל ${(archiveSize / 1024 / 1024).toFixed(2)} MiB. קורא את ספריית ה‑ZIP בטווחים…`);
+          const tailStart = Math.max(0, archiveSize - 65557);
+          const tail = new Uint8Array(await fetchRange(archiveUrl, tailStart, archiveSize - 1));
+          const endRecord = findEndRecord(tail);
+          const diskNumber = endRecord.view.getUint16(endRecord.offset + 4, true);
+          const centralDisk = endRecord.view.getUint16(endRecord.offset + 6, true);
+          const diskEntries = endRecord.view.getUint16(endRecord.offset + 8, true);
+          const entryCount = endRecord.view.getUint16(endRecord.offset + 10, true);
+          const directoryOffset = endRecord.view.getUint32(endRecord.offset + 16, true);
+          const directorySize = endRecord.view.getUint32(endRecord.offset + 12, true);
+          if (diskNumber || centralDisk || diskEntries !== entryCount) {
+            throw new Error("ארכיוני ZIP מפוצלים לכמה חלקים אינם נתמכים.");
+          }
+          if (directorySize === 0xffffffff || directoryOffset === 0xffffffff) {
+            throw new Error("ארכיון ZIP64 אינו נתמך בניסוי הזה.");
+          }
+          if (directorySize === 0) throw new Error("הארכיון ריק.");
+          if (directoryOffset + directorySize > archiveSize) {
+            throw new Error("מיקום תוכן ארכיון ה‑ZIP אינו תקין.");
+          }
+          const directory = new Uint8Array(await fetchRange(
+            archiveUrl, directoryOffset, directoryOffset + directorySize - 1
+          ));
+          videos = readVideoEntries(directory, entryCount);
+          entriesSelect.replaceChildren();
+          if (!videos.length) {
+            entriesSelect.add(new Option("לא נמצאו קובצי וידאו נתמכים", ""));
+            setStatus("לא נמצא MP4, MOV, M4V או WebM בארכיון.");
+            return;
+          }
+          videos.forEach((entry, index) => {
+            const method = entry.method === 0 ? "ללא דחיסה (Store)" : `שיטת דחיסה ${entry.method}`;
+            entriesSelect.add(new Option(`${entry.name} — ${method}`, String(index)));
+          });
+          entriesSelect.disabled = false;
+          playButton.disabled = false;
+          const stored = videos.filter(entry => entry.method === 0).length;
+          setStatus(`נמצאו ${videos.length} קובצי וידאו; ${stored} נשמרו ללא דחיסה. אפשר לבחור קובץ ולנסות לנגן.`);
+        } catch (error) {
+          setStatus(`הבדיקה נכשלה: ${error.message}\nאם מופיעה שגיאת CORS, שרת ה‑ZIP צריך לאפשר את מקור GitHub Pages ולתמוך ב‑HEAD וב‑Range.`);
+        } finally {
+          inspectButton.disabled = false;
+        }
+      });
+
+      playButton.addEventListener("click", async () => {
+        const entry = videos[Number(entriesSelect.value)];
+        if (!entry) return;
+        if (entry.method !== 0) {
+          setStatus("הסרטון דחוס בתוך ה‑ZIP. הניסוי תומך רק בקובץ שנשמר ללא דחיסה (Store).");
+          return;
+        }
+        if (entry.flags & 1) {
+          setStatus("הסרטון מוצפן בתוך ה‑ZIP ואי אפשר לקרוא אותו בניסוי הזה.");
+          return;
+        }
+        playButton.disabled = true;
+        video.hidden = true;
+        setStatus(`קורא את ${entry.name} מה‑ZIP במקטעים…`);
+        try {
+          const local = new DataView(await fetchRange(archiveUrl, entry.localOffset, entry.localOffset + 29));
+          if (local.getUint32(0, true) !== 0x04034b50) {
+            throw new Error("כותרת הקובץ המקומית ב‑ZIP אינה תקינה.");
+          }
+          const nameLength = local.getUint16(26, true);
+          const extraLength = local.getUint16(28, true);
+          const dataStart = entry.localOffset + 30 + nameLength + extraLength;
+          if (entry.compressedSize !== entry.uncompressedSize) {
+            throw new Error("גודל הקובץ אינו תואם לשיטת Store.");
+          }
+          const chunks = [];
+          const chunkSize = 1024 * 1024;
+          let loaded = 0;
+          while (loaded < entry.compressedSize) {
+            const end = Math.min(loaded + chunkSize, entry.compressedSize) - 1;
+            chunks.push(await fetchRange(archiveUrl, dataStart + loaded, dataStart + end));
+            loaded = end + 1;
+            setStatus(`נטענו ${(loaded / 1024 / 1024).toFixed(2)} מתוך ${(entry.uncompressedSize / 1024 / 1024).toFixed(2)} MiB לזיכרון הדפדפן…`);
+          }
+          const extension = entry.name.split(".").pop().toLowerCase();
+          const mime = extension === "webm" ? "video/webm" : extension === "mov" ? "video/quicktime" : "video/mp4";
+          const blob = new Blob(chunks, { type: mime });
+          if (objectUrl) URL.revokeObjectURL(objectUrl);
+          objectUrl = URL.createObjectURL(blob);
+          video.src = objectUrl;
+          video.hidden = false;
+          video.load();
+          setStatus("הסרטון נטען לזיכרון. אם הפורמט והקודק נתמכים בדפדפן, אפשר לנגן אותו.");
+          video.play().catch(() => setStatus("הסרטון נטען. לחצו על כפתור הניגון בנגן."));
+        } catch (error) {
+          setStatus(`טעינת הסרטון נכשלה: ${error.message}`);
+        } finally {
+          playButton.disabled = false;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
